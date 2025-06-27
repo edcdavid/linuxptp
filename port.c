@@ -29,6 +29,7 @@
 #include "clock.h"
 #include "designated_fsm.h"
 #include "filter.h"
+#include "metrics.h"
 #include "missing.h"
 #include "msg.h"
 #include "phc.h"
@@ -58,7 +59,7 @@ enum syfu_event {
 };
 
 static int port_is_ieee8021as(struct port *p);
-static int port_is_uds(struct port *p);
+//static int port_is_uds(struct port *p);
 static int port_has_security(struct port *p);
 static void port_nrate_initialize(struct port *p);
 
@@ -879,7 +880,7 @@ static int port_is_ieee8021as(struct port *p)
 	return p->follow_up_info ? 1 : 0;
 }
 
-static int port_is_uds(struct port *p)
+int port_is_uds(struct port *p)
 {
 	return transport_type(p->trp) == TRANS_UDS;
 }
@@ -1369,6 +1370,15 @@ void port_show_transition(struct port *p, enum port_state next,
 	} else {
 		pr_notice("%s: %s to %s on %s", p->log_name,
 			  ps_str[p->state], ps_str[next], ev_str[event]);
+	}
+	
+	/* Report state change via metrics socket */
+	if (p->clock && !port_is_uds(p)) {
+		struct metrics_reporter *metrics = clock_metrics(p->clock);
+		if (metrics) {
+			metrics_report_state_change(metrics, port_number(p),
+						    ps_str[p->state], ps_str[next], event);
+		}
 	}
 }
 

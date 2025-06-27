@@ -32,6 +32,7 @@
 #include "clockcheck.h"
 #include "foreign.h"
 #include "filter.h"
+#include "metrics.h"
 #include "missing.h"
 #include "msg.h"
 #include "phc.h"
@@ -150,6 +151,7 @@ struct clock {
 	struct time_zone tz[MAX_TIME_ZONES];
 	struct ClockIdentity ext_gm_identity;
 	int ext_gm_steps_removed;
+	struct metrics_reporter *metrics;
 };
 
 struct clock the_clock;
@@ -157,7 +159,7 @@ struct clock the_clock;
 static void handle_state_decision_event(struct clock *c);
 static int clock_resize_pollfd(struct clock *c, int new_nports);
 static void clock_remove_port(struct clock *c, struct port *p);
-static void clock_stats_display(struct clock_stats *s);
+static void clock_stats_display(struct metrics_reporter *metrics, struct clock_stats *s);
 
 static int clock_alttime_offset_append(struct clock *c, int key, struct ptp_message *m)
 {
@@ -369,6 +371,9 @@ void clock_destroy(struct clock *c)
 	stats_destroy(c->stats.delay);
 	if (c->sanity_check) {
 		clockcheck_destroy(c->sanity_check);
+	}
+	if (c->metrics) {
+		metrics_cleanup(c->metrics);
 	}
 	memset(c, 0, sizeof(*c));
 	msg_cleanup();
@@ -712,7 +717,7 @@ static int clock_management_set(struct clock *c, struct port *p,
 			/* Display stats on change of local_sync_uncertain */
 			if (c->local_sync_uncertain != mtd->val
 			    && stats_get_num_values(c->stats.offset))
-				clock_stats_display(&c->stats);
+				clock_stats_display(c->metrics, &c->stats);
 			c->local_sync_uncertain = mtd->val;
 			respond = 1;
 			break;
@@ -732,7 +737,7 @@ static int clock_management_set(struct clock *c, struct port *p,
 }
 
 static void clock_stats_update(struct clock_stats *s,
-			       double offset, double freq)
+			       struct metrics_reporter *metrics, double offset, double freq)
 {
 	stats_add_value(s->offset, offset);
 	stats_add_value(s->freq, freq);
@@ -740,10 +745,10 @@ static void clock_stats_update(struct clock_stats *s,
 	if (stats_get_num_values(s->offset) < s->max_count)
 		return;
 
-	clock_stats_display(s);
+	clock_stats_display(metrics, s);
 }
 
-static void clock_stats_display(struct clock_stats *s)
+static void clock_stats_display(struct metrics_reporter *metrics, struct clock_stats *s)
 {
 	struct stats_result offset_stats, freq_stats, delay_stats;
 
@@ -758,11 +763,23 @@ static void clock_stats_display(struct clock_stats *s)
 			offset_stats.rms, offset_stats.max_abs,
 			freq_stats.mean, freq_stats.stddev,
 			delay_stats.mean, delay_stats.stddev);
+		/* Report clock summary metrics via socket */
+		if (metrics) {
+			metrics_report_clock_summary(metrics, offset_stats.rms, offset_stats.max_abs,
+					       freq_stats.mean, freq_stats.stddev,
+					       delay_stats.mean, delay_stats.stddev);
+		}
 	} else {
 		pr_info("rms %4.0f max %4.0f "
 			"freq %+6.0f +/- %3.0f",
 			offset_stats.rms, offset_stats.max_abs,
 			freq_stats.mean, freq_stats.stddev);
+		/* Report clock summary metrics via socket */
+		if (metrics) {
+			metrics_report_clock_summary(metrics, offset_stats.rms, offset_stats.max_abs,
+					       freq_stats.mean, freq_stats.stddev,
+					       -1, -1);
+		}
 	}
 
 	stats_reset(s->offset);
@@ -813,12 +830,18 @@ static enum servo_state clock_no_adjust(struct clock *c, tmv_t ingress,
 	freq = (1.0 - ratio) * 1e9;
 
 	if (c->stats.max_count > 1) {
-		clock_stats_update(&c->stats, tmv_dbl(c->master_offset), freq);
+		clock_stats_update(&c->stats,c->metrics, tmv_dbl(c->master_offset), freq);
 	} else {
 		pr_info("master offset %10" PRId64 " s%d freq %+7.0f "
 			"path delay %9" PRId64,
 			tmv_to_nanoseconds(c->master_offset), state, freq,
 			tmv_to_nanoseconds(c->path_delay));
+	}
+
+	/* Always report real-time clock metrics via socket - regardless of logging mode */
+	if (c->metrics) {
+		metrics_report_clock(c->metrics,
+			tmv_dbl(c->master_offset), freq, tmv_dbl(c->path_delay));
 	}
 
 	fui = 1.0 + (c->status.cumulativeScaledRateOffset + 0.0) / POW2_41;
@@ -1449,6 +1472,20 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 	if (!c->slave_event_monitor) {
 		pr_err("failed to create slave event monitor");
 		return NULL;
+	}
+
+	/* Initialize metrics reporting. */
+	const char *metrics_socket = config_get_string(config, NULL, "metrics_socket");
+	if (metrics_socket) {
+		const char *clock_summary_filter = config_get_string(config, NULL, "metrics_filter_clock_summary");
+				const char *clock_filter = config_get_string(config, NULL, "metrics_filter_clock");
+		const char *state_filter = config_get_string(config, NULL, "metrics_filter_state");
+
+		c->metrics = metrics_init_with_filters(metrics_socket, clock_summary_filter,
+						       clock_filter, state_filter);
+		if (!c->metrics) {
+			pr_warning("failed to initialize metrics reporting");
+		}
 	}
 
 	/* Create the ports. */
@@ -2114,12 +2151,18 @@ enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
 	}
 
 	if (c->stats.max_count > 1) {
-		clock_stats_update(&c->stats, tmv_dbl(c->master_offset), adj);
+		clock_stats_update(&c->stats, c->metrics, tmv_dbl(c->master_offset), adj);
 	} else {
 		pr_info("master offset %10" PRId64 " s%d freq %+7.0f "
 			"path delay %9" PRId64,
 			tmv_to_nanoseconds(c->master_offset), state, adj,
 			tmv_to_nanoseconds(c->path_delay));
+	}
+
+	/* Always report real-time clock metrics via socket - regardless of logging mode */
+	if (c->metrics) {
+		metrics_report_clock(c->metrics,
+			tmv_dbl(c->master_offset), adj, tmv_dbl(c->path_delay));
 	}
 
 	clock_notify_event(c, NOTIFY_TIME_SYNC);
@@ -2346,4 +2389,9 @@ struct servo *clock_servo(struct clock *c)
 enum servo_state clock_servo_state(struct clock *c)
 {
 	return c->servo_state;
+}
+
+struct metrics_reporter *clock_metrics(struct clock *c)
+{
+	return c->metrics;
 }

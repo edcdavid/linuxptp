@@ -396,4 +396,5 @@ void clock_check_ts(struct clock *c, uint64_t ts);
  */
 double clock_rate_ratio(struct clock *c);
 
+struct metrics_reporter *clock_metrics(struct clock *c);
 #endif

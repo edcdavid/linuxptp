@@ -58,6 +58,10 @@
             under GPL3. An additional flag is required for linking:
             ~make EXTRA_CFLAGS=-DUSE_OPENSSL~
 
+  - Provides real-time PTP metrics reporting via Unix sockets with JSON
+    output, including clock summary statistics, synchronization events,
+    and state changes with configurable(with [[https://github.com/codeplea/tinyexpr/tree/logic][tinyexpr]]) edge-triggered filtering.
+
 * Getting the Code
 
   You can download the latest released version at Source Forge.

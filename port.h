@@ -31,7 +31,8 @@
 /* forward declarations */
 struct interface;
 struct clock;
-
+struct metrics_reporter;
+int port_is_uds(struct port *p);
 /** Opaque type. */
 struct port;
 
